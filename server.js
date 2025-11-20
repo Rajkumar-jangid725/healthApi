@@ -296,3 +296,69 @@ app.get("/healthdata/:userId/:metric", async (req, res) => {
         res.status(500).json({ error: error.message });
     }
 });
+
+// ✅ GET: Latest timestamp from HealthData collection
+app.get("/latest-healthdata", async (req, res) => {
+    try {
+        const latestData = await HealthData.findOne()
+            .sort({ timestamp: -1 })
+            .select("timestamp userId _id");
+
+        if (!latestData) {
+            return res.status(200).json({
+                success: true,
+                message: "No health data found",
+                latestTimestamp: null
+            });
+        }
+
+        res.status(200).json({
+            latestTimestamp: latestData.timestamp,
+            userId: latestData.userId
+        });
+    } catch (error) {
+        console.error("❌ Error fetching latest timestamp:", error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+
+app.post("/latest-healthdata", async (req, res) => {
+    try {
+        const { userId } = req.body;
+
+        if (!userId) {
+            return res.status(400).json({
+                success: false,
+                message: "userId is required in the request body"
+            });
+        }
+
+        const latestData = await HealthData.findOne({ userId })
+            .sort({ timestamp: -1 })
+            .select("timestamp userId _id");
+
+        if (!latestData) {
+            return res.status(200).json({
+                success: true,
+                message: "No health data found for this user",
+                latestTimestamp: null
+            });
+        }
+
+        res.status(200).json({
+            success: true,
+            latestTimestamp: latestData.timestamp,
+            userId: latestData.userId
+        });
+    } catch (error) {
+        console.error("❌ Error fetching latest timestamp:", error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
