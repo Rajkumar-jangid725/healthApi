@@ -1,11 +1,11 @@
 const mongoose = require('mongoose');
 
-const BloodGlucoseSchema = new mongoose.Schema({
+const GlucoseSchema = new mongoose.Schema({
   userId: { type: String, required: true, index: true },
   timestamp: { type: Date, required: true, index: true },
-  level: { type: Number },
+  mmolPerL: { type: Number },
 }, { timestamps: true });
 
-BloodGlucoseSchema.index({ userId: 1, timestamp: -1 });
+GlucoseSchema.index({ userId: 1, timestamp: -1 });
 
-module.exports = mongoose.model('BloodGlucose', BloodGlucoseSchema);
+module.exports = mongoose.model('BloodGlucose', GlucoseSchema);

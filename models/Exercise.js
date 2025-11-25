@@ -7,6 +7,7 @@ const ExerciseSchema = new mongoose.Schema({
   startTime: { type: Date },
   endTime: { type: Date },
   durationMinutes: { type: Number },
+  raw: { type: mongoose.Schema.Types.Mixed },
 }, { timestamps: true });
 
 ExerciseSchema.index({ userId: 1, timestamp: -1 });

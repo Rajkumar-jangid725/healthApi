@@ -24,8 +24,8 @@ const PORT = process.env.PORT || 5000;
 
 // Middleware
 app.use(cors());
-app.use(bodyParser.json({ limit: "10mb" }));
-app.use(bodyParser.urlencoded({ extended: true, limit: "10mb" }));
+app.use(bodyParser.json({ limit: "20mb" }));
+app.use(bodyParser.urlencoded({ extended: true, limit: "20mb" }));
 
 // MongoDB Connection
 const MONGODB_URI =
@@ -37,235 +37,277 @@ mongoose
     .connect(MONGODB_URI, {
         useNewUrlParser: true,
         useUnifiedTopology: true,
-        serverSelectionTimeoutMS: 10000, // 10s timeout
+        serverSelectionTimeoutMS: 10000,
     })
     .then(() => {
-        console.log("✅ MongoDB connected successfully");
+        console.log("✅ MongoDB connected");
 
-        // Start server ONLY after successful DB connection
-        app.listen(PORT, "0.0.0.0", () => {
-            console.log(`🚀 Server running on http://0.0.0.0:${PORT}`);
-            console.log(`📊 Health data endpoint: http://0.0.0.0:${PORT}/healthdata`);
-        });
+        app.listen(PORT, "0.0.0.0", () =>
+            console.log(`🚀 Server running on http://0.0.0.0:${PORT}`)
+        );
     })
     .catch((err) => {
-        console.error("❌ MongoDB connection error:", err.message);
+        console.error("❌ MongoDB Error:", err.message);
         process.exit(1);
     });
 
-// =============== ROUTES =============== //
+/* ------------------------------------------------------------------
+    GET LATEST HEALTHDATA TIMESTAMP FOR A USER
+-------------------------------------------------------------------*/
+app.post("/latest-healthdata", async (req, res) => {
+    try {
+        const { userId } = req.body;
+        if (!userId)
+            return res.status(400).json({ message: "userId is required" });
 
-// Health check
-app.get("/health", (req, res) => {
-    res.status(200).json({
-        status: "OK",
-        timestamp: new Date(),
-        message: "Health API is running",
-    });
+        const latest = await HealthData.findOne({ userId })
+            .sort({ timestamp: -1 })
+            .select("timestamp");
+
+        res.status(200).json({
+            success: true,
+            latestTimestamp: latest ? latest.timestamp : null,
+        });
+    } catch (err) {
+        console.error("❌ Error /latest-healthdata:", err);
+        res.status(500).json({ error: err.message });
+    }
 });
 
-// ✅ POST: Save health data
+/* ------------------------------------------------------------------
+    SAVE HEALTH DATA (RAW + COMBINED)
+-------------------------------------------------------------------*/
 app.post("/healthdata", async (req, res) => {
     try {
         const data = req.body;
+        const {
+            userId,
+            timestamp,
+            combined,
+            steps,
+            heartRate,
+            calories,
+            activeCalories,
+            distance,
+            oxygenSaturation,
+            bloodPressure,
+            bloodGlucose,
+            bodyTemperature,
+            weight,
+            hydration,
+            sleep,
+            exercise,
+        } = data;
 
-        const { userId, timestamp } = data;
-        if (!userId) return res.status(400).json({ error: "userId is required" });
+        if (!userId) {
+            return res.status(400).json({ error: "userId is required" });
+        }
 
-        const healthData = new HealthData({
+        /* ------------------------------------------------------------
+            1) SAVE COMBINED SUMMARY INTO HealthData
+        -------------------------------------------------------------*/
+        const combinedRow = new HealthData({
             userId,
             timestamp: timestamp || new Date(),
-            steps: data.steps?.total || 0,
-            heartRate: data.heartRate?.average || null,
-            calories: data.calories?.total || 0,
-            distance: data.distance?.totalMeters || 0,
-            oxygenSaturation: data.oxygenSaturation?.average || null,
-            sleepMinutes: data.sleep?.totalMinutes || 0,
+            steps: combined?.stepsTotal || 0,
+            heartRate: combined?.heartRateAvg || null,
+            calories: combined?.caloriesTotal || 0,
+            distance: combined?.distanceMeters || 0,
+            oxygenSaturation: combined?.oxygenAvg || null,
+            sleepMinutes: combined?.sleepMinutesTotal || 0,
         });
 
-        await healthData.save();
+        await combinedRow.save();
 
-        // Save Steps details
-        if (Array.isArray(data.steps?.records) && data.steps.records.length > 0) {
-            const stepsRecords = data.steps.records.map((r) => ({
+        /* ------------------------------------------------------------
+            2) SAVE RAW INDIVIDUAL ROWS (actual health records)
+        -------------------------------------------------------------*/
+
+        // --- STEPS ---
+        if (steps?.length) {
+            const formatted = steps.map((r) => ({
                 userId,
-                timestamp: new Date(r.endTime || timestamp),
+                timestamp: new Date(r.endTime || r.startTime || timestamp),
                 count: r.count,
                 startTime: new Date(r.startTime),
                 endTime: new Date(r.endTime),
             }));
-            await Steps.insertMany(stepsRecords);
+            await Steps.insertMany(formatted);
         }
 
-        // Heart Rate
-        if (Array.isArray(data.heartRate?.samples) && data.heartRate.samples.length > 0) {
-            const hrRecord = new HeartRate({
+        // --- HEART RATE ---
+        if (heartRate?.length) {
+            const hrRows = heartRate.map((h) => ({
                 userId,
-                timestamp: new Date(timestamp),
-                average: data.heartRate.average,
-                min: data.heartRate.min,
-                max: data.heartRate.max,
-                samples: data.heartRate.samples,
-            });
-            await hrRecord.save();
+                bpm: h.bpm || null,
+                timestamp: new Date(h.timestamp),
+            }));
+            await HeartRate.insertMany(hrRows);
         }
 
-        // Calories
-        if (data.calories) {
-            await new Calories({
+        // --- CALORIES ---
+        if (calories?.length) {
+            const rows = calories.map((r) => ({
                 userId,
-                timestamp: new Date(timestamp),
-                totalCalories: data.calories.total || 0,
-                activeCalories: data.calories.active || 0,
-            }).save();
+                timestamp: new Date(r.timestamp),
+                totalCalories: r.kcal || 0,
+                startTime: new Date(r.startTime),
+                endTime: new Date(r.endTime),
+            }));
+            await Calories.insertMany(rows);
         }
 
-        // Distance
-        if (data.distance) {
-            await new Distance({
+        // --- ACTIVE CALORIES ---
+        if (activeCalories?.length) {
+            const rows = activeCalories.map((r) => ({
                 userId,
-                timestamp: new Date(timestamp),
-                totalMeters: data.distance.totalMeters || 0,
-                totalKilometers: parseFloat(data.distance.totalKilometers) || 0,
-            }).save();
+                timestamp: new Date(r.timestamp),
+                activeCalories: r.kcal || 0,
+                startTime: new Date(r.startTime),
+                endTime: new Date(r.endTime),
+            }));
+            await Calories.insertMany(rows);
         }
 
-        // Oxygen Saturation
-        if (Array.isArray(data.oxygenSaturation?.samples) && data.oxygenSaturation.samples.length > 0) {
-            await new OxygenSaturation({
+        // --- DISTANCE ---
+        if (distance?.length) {
+            const rows = distance.map((r) => ({
                 userId,
-                timestamp: new Date(timestamp),
-                average: parseFloat(data.oxygenSaturation.average),
-                samples: data.oxygenSaturation.samples,
-            }).save();
+                timestamp: new Date(r.timestamp),
+                totalMeters: r.meters || 0,
+                startTime: new Date(r.startTime),
+                endTime: new Date(r.endTime),
+            }));
+            await Distance.insertMany(rows);
         }
 
-        // Sleep
-        if (data.sleep && data.sleep.totalMinutes > 0) {
-            await new Sleep({
+        // --- OXYGEN ---
+        if (oxygenSaturation?.length) {
+            const rows = oxygenSaturation.map((o) => ({
                 userId,
-                timestamp: new Date(timestamp),
-                totalMinutes: data.sleep.totalMinutes,
-                totalHours: parseFloat(data.sleep.totalHours),
-                sessions: data.sleep.sessions,
-            }).save();
+                timestamp: new Date(o.timestamp),
+                average: o.percentage,
+                samples: [o.percentage],
+            }));
+            await OxygenSaturation.insertMany(rows);
         }
 
-        // Blood Pressure
-        if (data.bloodPressure) {
-            await new BloodPressure({
+        // --- BLOOD PRESSURE ---
+        if (bloodPressure?.length) {
+            const rows = bloodPressure.map((bp) => ({
                 userId,
-                timestamp: new Date(data.bloodPressure.timestamp || timestamp),
-                systolic: data.bloodPressure.systolic,
-                diastolic: data.bloodPressure.diastolic,
-            }).save();
+                timestamp: new Date(bp.timestamp),
+                systolic: bp.systolic,
+                diastolic: bp.diastolic,
+            }));
+            await BloodPressure.insertMany(rows);
         }
 
-        // Blood Glucose
-        if (data.bloodGlucose) {
-            await new BloodGlucose({
+        // --- BLOOD GLUCOSE ---
+        if (bloodGlucose?.length) {
+            const rows = bloodGlucose.map((g) => ({
                 userId,
-                timestamp: new Date(data.bloodGlucose.timestamp || timestamp),
-                level: data.bloodGlucose.level,
-            }).save();
+                timestamp: new Date(g.timestamp),
+                level: g.level,
+            }));
+            await BloodGlucose.insertMany(rows);
         }
 
-        // Body Temperature
-        if (data.bodyTemperature) {
-            await new BodyTemperature({
+        // --- BODY TEMPERATURE ---
+        if (bodyTemperature?.length) {
+            const rows = bodyTemperature.map((t) => ({
                 userId,
-                timestamp: new Date(data.bodyTemperature.timestamp || timestamp),
-                celsius: data.bodyTemperature.celsius,
-            }).save();
+                timestamp: new Date(t.timestamp),
+                celsius: t.celsius,
+            }));
+            await BodyTemperature.insertMany(rows);
         }
 
-        // Weight
-        if (data.weight) {
-            await new Weight({
+        // --- WEIGHT ---
+        if (weight?.length) {
+            const rows = weight.map((w) => ({
                 userId,
-                timestamp: new Date(data.weight.timestamp || timestamp),
-                kilograms: data.weight.kilograms,
-            }).save();
+                timestamp: new Date(w.timestamp),
+                kilograms: w.kilograms,
+            }));
+            await Weight.insertMany(rows);
         }
 
-        // Hydration
-        if (data.hydration) {
-            await new Hydration({
+        // --- HYDRATION ---
+        if (hydration?.length) {
+            const rows = hydration.map((h) => ({
                 userId,
-                timestamp: new Date(timestamp),
-                totalLiters: parseFloat(data.hydration.totalLiters),
-            }).save();
+                timestamp: new Date(h.timestamp),
+                totalLiters: h.liters,
+            }));
+            await Hydration.insertMany(rows);
         }
 
-        // Exercise
-        if (Array.isArray(data.exercise?.details) && data.exercise.details.length > 0) {
-            const exerciseRecords = data.exercise.details.map((e) => ({
+        // --- SLEEP ---
+        if (sleep?.length) {
+            const rows = sleep.map((s) => ({
                 userId,
-                timestamp: new Date(e.endTime || timestamp),
+                startTime: new Date(s.startTime),
+                endTime: new Date(s.endTime),
+                timestamp: new Date(s.endTime),
+                totalMinutes: s.durationMinutes,
+                totalHours: parseFloat((s.durationMinutes / 60).toFixed(2)),
+                sessions: 1,
+            }));
+            await Sleep.insertMany(rows);
+        }
+
+        // --- EXERCISE ---
+        if (exercise?.length) {
+            const rows = exercise.map((e) => ({
+                userId,
+                timestamp: new Date(e.endTime || e.startTime),
                 type: e.type,
                 startTime: new Date(e.startTime),
                 endTime: new Date(e.endTime),
-                durationMinutes: e.duration,
+                durationMinutes: e.durationMinutes,
             }));
-            await Exercise.insertMany(exerciseRecords);
+            await Exercise.insertMany(rows);
         }
 
         res.status(200).json({
             success: true,
             message: "Health data saved successfully",
-            recordId: healthData._id,
+            recordId: combinedRow._id,
         });
     } catch (error) {
-        console.error("❌ Error saving health data:", error);
+        console.error("❌ Error saving healthdata:", error);
         res.status(500).json({ success: false, error: error.message });
     }
 });
 
-// ✅ GET: All health data for user
+/* ------------------------------------------------------------------
+    GET ALL HEALTH DATA SUMMARY
+-------------------------------------------------------------------*/
 app.get("/healthdata/:userId", async (req, res) => {
     try {
         const { userId } = req.params;
-        const { startDate, endDate } = req.query;
 
-        const query = { userId };
-        if (startDate || endDate) {
-            query.timestamp = {};
-            if (startDate) query.timestamp.$gte = new Date(startDate);
-            if (endDate) query.timestamp.$lte = new Date(endDate);
-        }
-
-        const healthData = await HealthData.find(query)
+        const data = await HealthData.find({ userId })
             .sort({ timestamp: -1 })
             .limit(100);
 
-        res.status(200).json({
-            success: true,
-            count: healthData.length,
-            data: healthData,
-        });
-    } catch (error) {
-        console.error("❌ Error fetching health data:", error);
-        res.status(500).json({ error: error.message });
+        res.status(200).json({ success: true, data });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
     }
 });
 
-// ✅ GET: Specific health metric
+/* ------------------------------------------------------------------
+    GET RAW METRIC DATA
+-------------------------------------------------------------------*/
 app.get("/healthdata/:userId/:metric", async (req, res) => {
     try {
         const { userId, metric } = req.params;
-        const { startDate, endDate, limit = 100 } = req.query;
 
-        const query = { userId };
-        if (startDate || endDate) {
-            query.timestamp = {};
-            if (startDate) query.timestamp.$gte = new Date(startDate);
-            if (endDate) query.timestamp.$lte = new Date(endDate);
-        }
-
-        const modelMap = {
+        const collections = {
             steps: Steps,
             heartrate: HeartRate,
-            sleep: Sleep,
             calories: Calories,
             oxygen: OxygenSaturation,
             distance: Distance,
@@ -274,91 +316,23 @@ app.get("/healthdata/:userId/:metric", async (req, res) => {
             temperature: BodyTemperature,
             weight: Weight,
             hydration: Hydration,
+            sleep: Sleep,
             exercise: Exercise,
         };
 
-        const Model = modelMap[metric.toLowerCase()];
+        const Model = collections[metric.toLowerCase()];
         if (!Model)
-            return res.status(400).json({ error: "Invalid metric specified" });
+            return res.status(400).json({ error: "Invalid metric name" });
 
-        const data = await Model.find(query)
+        const data = await Model.find({ userId })
             .sort({ timestamp: -1 })
-            .limit(parseInt(limit));
+            .limit(200);
 
-        res.status(200).json({
-            success: true,
-            metric,
-            count: data.length,
-            data,
-        });
-    } catch (error) {
-        console.error("❌ Error fetching metric data:", error);
-        res.status(500).json({ error: error.message });
+        res.status(200).json({ success: true, data });
+    } catch (err) {
+        console.error("❌ Error fetching metric:", err);
+        res.status(500).json({ error: err.message });
     }
 });
 
-// ✅ GET: Latest timestamp from HealthData collection
-app.get("/latest-healthdata", async (req, res) => {
-    try {
-        const latestData = await HealthData.findOne()
-            .sort({ timestamp: -1 })
-            .select("timestamp userId _id");
-
-        if (!latestData) {
-            return res.status(200).json({
-                success: true,
-                message: "No health data found",
-                latestTimestamp: null
-            });
-        }
-
-        res.status(200).json({
-            latestTimestamp: latestData.timestamp,
-            userId: latestData.userId
-        });
-    } catch (error) {
-        console.error("❌ Error fetching latest timestamp:", error);
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
-    }
-});
-
-
-app.post("/latest-healthdata", async (req, res) => {
-    try {
-        const { userId } = req.body;
-
-        if (!userId) {
-            return res.status(400).json({
-                success: false,
-                message: "userId is required in the request body"
-            });
-        }
-
-        const latestData = await HealthData.findOne({ userId })
-            .sort({ timestamp: -1 })
-            .select("timestamp userId _id");
-
-        if (!latestData) {
-            return res.status(200).json({
-                success: true,
-                message: "No health data found for this user",
-                latestTimestamp: null
-            });
-        }
-
-        res.status(200).json({
-            success: true,
-            latestTimestamp: latestData.timestamp,
-            userId: latestData.userId
-        });
-    } catch (error) {
-        console.error("❌ Error fetching latest timestamp:", error);
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
-    }
-});
+module.exports = app;
