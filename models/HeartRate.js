@@ -2,11 +2,10 @@ const mongoose = require('mongoose');
 
 const HeartRateSchema = new mongoose.Schema({
   userId: { type: String, required: true, index: true },
-  timestamp: { type: Date, required: true, index: true }, // sample time
+  healthDataId: { type: mongoose.Schema.Types.ObjectId, ref: 'HealthData', index: true },
+  timestamp: { type: Date, required: true, index: true },
   bpm: { type: Number, required: true },
-  sourceRecordStart: { type: Date }, // optional: original record start
-  sourceRecordEnd: { type: Date },   // optional: original record end
-}, { timestamps: true });
+}, { timestamps: true, strict: false });
 
 HeartRateSchema.index({ userId: 1, timestamp: -1 });
 

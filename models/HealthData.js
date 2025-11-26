@@ -2,9 +2,8 @@ const mongoose = require('mongoose');
 
 const HealthDataSchema = new mongoose.Schema({
   userId: { type: String, required: true, index: true },
-  timestamp: { type: Date, required: true, index: true },
+  timestamp: { type: Date, required: true },
 
-  // brief summary values
   steps: { type: Number, default: 0 },
   heartRate: { type: Number, default: null },
   calories: { type: Number, default: 0 },

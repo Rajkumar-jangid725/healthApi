@@ -4,7 +4,8 @@ const cors = require("cors");
 const bodyParser = require("body-parser");
 require("dotenv").config();
 
-// Models
+const { flattenDeep } = require("./utils/flatten");
+
 const HealthData = require("./models/HealthData");
 const Steps = require("./models/Steps");
 const HeartRate = require("./models/HeartRate");
@@ -22,61 +23,40 @@ const Exercise = require("./models/Exercise");
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// Middleware
 app.use(cors());
-app.use(bodyParser.json({ limit: "20mb" }));
-app.use(bodyParser.urlencoded({ extended: true, limit: "20mb" }));
+app.use(bodyParser.json({ limit: "50mb" }));
+app.use(bodyParser.urlencoded({ extended: true, limit: "50mb" }));
 
-// MongoDB Connection
-const MONGODB_URI =
-    process.env.MONGODB_URI || "mongodb://localhost:27017/healthapp";
-
+const MONGODB_URI = process.env.MONGODB_URI || "mongodb://localhost:27017/healthapp";
 mongoose.set("strictQuery", false);
 
-mongoose
-    .connect(MONGODB_URI, {
-        useNewUrlParser: true,
-        useUnifiedTopology: true,
-        serverSelectionTimeoutMS: 10000,
-    })
+mongoose.connect(MONGODB_URI, {
+    useNewUrlParser: true,
+    useUnifiedTopology: true,
+    serverSelectionTimeoutMS: 10000,
+})
     .then(() => {
         console.log("✅ MongoDB connected");
-
-        app.listen(PORT, "0.0.0.0", () =>
-            console.log(`🚀 Server running on http://0.0.0.0:${PORT}`)
-        );
+        app.listen(PORT, "0.0.0.0", () => console.log(`🚀 Server running on http://0.0.0.0:${PORT}`));
     })
     .catch((err) => {
         console.error("❌ MongoDB Error:", err.message);
         process.exit(1);
     });
 
-/* ------------------------------------------------------------------
-    GET LATEST HEALTHDATA TIMESTAMP FOR A USER
--------------------------------------------------------------------*/
 app.post("/latest-healthdata", async (req, res) => {
     try {
         const { userId } = req.body;
-        if (!userId)
-            return res.status(400).json({ message: "userId is required" });
+        if (!userId) return res.status(400).json({ message: "userId is required" });
 
-        const latest = await HealthData.findOne({ userId })
-            .sort({ timestamp: -1 })
-            .select("timestamp");
-
-        res.status(200).json({
-            success: true,
-            latestTimestamp: latest ? latest.timestamp : null,
-        });
+        const latest = await HealthData.findOne({ userId }).sort({ timestamp: -1 }).select("timestamp");
+        res.status(200).json({ success: true, latestTimestamp: latest ? latest.timestamp : null });
     } catch (err) {
         console.error("❌ Error /latest-healthdata:", err);
         res.status(500).json({ error: err.message });
     }
 });
 
-/* ------------------------------------------------------------------
-    SAVE HEALTH DATA (RAW + COMBINED)
--------------------------------------------------------------------*/
 app.post("/healthdata", async (req, res) => {
     try {
         const data = req.body;
@@ -99,16 +79,11 @@ app.post("/healthdata", async (req, res) => {
             exercise,
         } = data;
 
-        if (!userId) {
-            return res.status(400).json({ error: "userId is required" });
-        }
+        if (!userId) return res.status(400).json({ error: "userId is required" });
 
-        /* ------------------------------------------------------------
-            1) SAVE COMBINED SUMMARY INTO HealthData
-        -------------------------------------------------------------*/
         const combinedRow = new HealthData({
             userId,
-            timestamp: timestamp || new Date(),
+            timestamp: timestamp ? new Date(timestamp) : new Date(),
             steps: combined?.stepsTotal || 0,
             heartRate: combined?.heartRateAvg || null,
             calories: combined?.caloriesTotal || 0,
@@ -119,158 +94,258 @@ app.post("/healthdata", async (req, res) => {
 
         await combinedRow.save();
 
-        /* ------------------------------------------------------------
-            2) SAVE RAW INDIVIDUAL ROWS (actual health records)
-        -------------------------------------------------------------*/
+        const healthDataId = combinedRow._id;
 
-        // --- STEPS ---
-        if (steps?.length) {
-            const formatted = steps.map((r) => ({
-                userId,
-                timestamp: new Date(r.endTime || r.startTime || timestamp),
-                count: r.count,
-                startTime: new Date(r.startTime),
-                endTime: new Date(r.endTime),
-            }));
-            await Steps.insertMany(formatted);
+        const safeDate = (v) => (v ? new Date(v) : null);
+        const flattenAndPrefix = (obj, prefix) => {
+            if (!obj || typeof obj !== "object") return {};
+            const flat = flattenDeep(obj);
+            const prefixed = {};
+            for (const k of Object.keys(flat)) {
+                prefixed[`${prefix}${k}`] = flat[k];
+            }
+            return prefixed;
+        };
+
+        if (Array.isArray(steps) && steps.length) {
+            const docs = steps.map((r) => {
+                const ts = safeDate(r.endTime || r.timestamp || r.startTime || timestamp);
+                const base = {
+                    userId,
+                    healthDataId,
+                    timestamp: ts || new Date(),
+                    count: r.count ?? r.value ?? 0,
+                    startTime: safeDate(r.startTime),
+                    endTime: safeDate(r.endTime),
+                };
+                if (r.raw) {
+                    Object.assign(base, flattenAndPrefix(r.raw, ""));
+                    if (r.raw.metadata) Object.assign(base, flattenAndPrefix(r.raw.metadata, "metadata_"));
+                }
+                return base;
+            });
+            await Steps.insertMany(docs);
         }
 
-        // --- HEART RATE ---
-        if (heartRate?.length) {
-            const hrRows = heartRate.map((h) => ({
-                userId,
-                bpm: h.bpm || null,
-                timestamp: new Date(h.timestamp),
-            }));
-            await HeartRate.insertMany(hrRows);
+        if (Array.isArray(heartRate) && heartRate.length) {
+            const docs = heartRate.map((h) => {
+                const ts = safeDate(h.timestamp || h.time || timestamp);
+                const base = {
+                    userId,
+                    healthDataId,
+                    timestamp: ts || new Date(),
+                    bpm: h.bpm ?? h.beatsPerMinute ?? null,
+                };
+                if (h.rawSample) Object.assign(base, flattenAndPrefix(h.rawSample, "rawSample_"));
+                if (h.raw) Object.assign(base, flattenAndPrefix(h.raw, ""));
+                if (h.metadata) Object.assign(base, flattenAndPrefix(h.metadata, "metadata_"));
+                return base;
+            });
+            await HeartRate.insertMany(docs);
         }
 
-        // --- CALORIES ---
-        if (calories?.length) {
-            const rows = calories.map((r) => ({
-                userId,
-                timestamp: new Date(r.timestamp),
-                totalCalories: r.kcal || 0,
-                startTime: new Date(r.startTime),
-                endTime: new Date(r.endTime),
-            }));
-            await Calories.insertMany(rows);
+        const pushCalories = async (arr, typeLabel = "total") => {
+            if (!Array.isArray(arr) || !arr.length) return;
+            const docs = arr.map((r) => {
+                const ts = safeDate(r.timestamp || r.endTime || r.startTime || timestamp);
+                const base = {
+                    userId,
+                    healthDataId,
+                    timestamp: ts || new Date(),
+                    kilocalories: r.kcal ?? r.kilocalories ?? null,
+                    type: typeLabel,
+                    startTime: safeDate(r.startTime),
+                    endTime: safeDate(r.endTime),
+                };
+                if (r.raw) {
+                    Object.assign(base, flattenAndPrefix(r.raw, ""));
+                    if (r.raw.metadata) Object.assign(base, flattenAndPrefix(r.raw.metadata, "metadata_"));
+                    if (r.raw.energy) Object.assign(base, flattenAndPrefix(r.raw.energy, "energy_"));
+                }
+                return base;
+            });
+            await Calories.insertMany(docs);
+        };
+
+        await pushCalories(calories, "total");
+        await pushCalories(activeCalories, "active");
+
+        if (Array.isArray(distance) && distance.length) {
+            const docs = distance.map((r) => {
+                const ts = safeDate(r.timestamp || r.endTime || r.startTime || timestamp);
+                const base = {
+                    userId,
+                    healthDataId,
+                    timestamp: ts || new Date(),
+                    meters: r.meters ?? (r.distance?.inMeters) ?? 0,
+                    startTime: safeDate(r.startTime),
+                    endTime: safeDate(r.endTime),
+                };
+                if (r.raw) {
+                    Object.assign(base, flattenAndPrefix(r.raw, ""));
+                    if (r.raw.metadata) Object.assign(base, flattenAndPrefix(r.raw.metadata, "metadata_"));
+                    if (r.raw.distance) Object.assign(base, flattenAndPrefix(r.raw.distance, "distance_"));
+                }
+                return base;
+            });
+            await Distance.insertMany(docs);
         }
 
-        // --- ACTIVE CALORIES ---
-        if (activeCalories?.length) {
-            const rows = activeCalories.map((r) => ({
-                userId,
-                timestamp: new Date(r.timestamp),
-                activeCalories: r.kcal || 0,
-                startTime: new Date(r.startTime),
-                endTime: new Date(r.endTime),
-            }));
-            await Calories.insertMany(rows);
+        if (Array.isArray(oxygenSaturation) && oxygenSaturation.length) {
+            const docs = oxygenSaturation.map((o) => {
+                const ts = safeDate(o.timestamp || o.time || timestamp);
+                const base = {
+                    userId,
+                    healthDataId,
+                    timestamp: ts || new Date(),
+                    percentage: o.percentage ?? o.value ?? null,
+                };
+                if (o.raw) {
+                    Object.assign(base, flattenAndPrefix(o.raw, ""));
+                    if (o.raw.metadata) Object.assign(base, flattenAndPrefix(o.raw.metadata, "metadata_"));
+                }
+                return base;
+            });
+            await OxygenSaturation.insertMany(docs);
         }
 
-        // --- DISTANCE ---
-        if (distance?.length) {
-            const rows = distance.map((r) => ({
-                userId,
-                timestamp: new Date(r.timestamp),
-                totalMeters: r.meters || 0,
-                startTime: new Date(r.startTime),
-                endTime: new Date(r.endTime),
-            }));
-            await Distance.insertMany(rows);
+        if (Array.isArray(bloodPressure) && bloodPressure.length) {
+            const docs = bloodPressure.map((bp) => {
+                const ts = safeDate(bp.timestamp || bp.time || timestamp);
+                const base = {
+                    userId,
+                    healthDataId,
+                    timestamp: ts || new Date(),
+                    systolic: bp.systolic ?? bp.systolicValue ?? null,
+                    diastolic: bp.diastolic ?? bp.diastolicValue ?? null,
+                };
+                if (bp.raw) {
+                    Object.assign(base, flattenAndPrefix(bp.raw, ""));
+                    if (bp.raw.metadata) Object.assign(base, flattenAndPrefix(bp.raw.metadata, "metadata_"));
+                }
+                return base;
+            });
+            await BloodPressure.insertMany(docs);
         }
 
-        // --- OXYGEN ---
-        if (oxygenSaturation?.length) {
-            const rows = oxygenSaturation.map((o) => ({
-                userId,
-                timestamp: new Date(o.timestamp),
-                average: o.percentage,
-                samples: [o.percentage],
-            }));
-            await OxygenSaturation.insertMany(rows);
+        if (Array.isArray(bloodGlucose) && bloodGlucose.length) {
+            const docs = bloodGlucose.map((g) => {
+                const ts = safeDate(g.timestamp || timestamp);
+                const base = {
+                    userId,
+                    healthDataId,
+                    timestamp: ts || new Date(),
+                    mmolPerL: g.level ?? g.mmolPerL ?? g.value ?? null,
+                };
+                if (g.raw) {
+                    Object.assign(base, flattenAndPrefix(g.raw, ""));
+                    if (g.raw.metadata) Object.assign(base, flattenAndPrefix(g.raw.metadata, "metadata_"));
+                }
+                return base;
+            });
+            await BloodGlucose.insertMany(docs);
         }
 
-        // --- BLOOD PRESSURE ---
-        if (bloodPressure?.length) {
-            const rows = bloodPressure.map((bp) => ({
-                userId,
-                timestamp: new Date(bp.timestamp),
-                systolic: bp.systolic,
-                diastolic: bp.diastolic,
-            }));
-            await BloodPressure.insertMany(rows);
+        if (Array.isArray(bodyTemperature) && bodyTemperature.length) {
+            const docs = bodyTemperature.map((t) => {
+                const ts = safeDate(t.timestamp || t.endTime || t.startTime || timestamp);
+                const base = {
+                    userId,
+                    healthDataId,
+                    timestamp: ts || new Date(),
+                    celsius: t.celsius ?? t.value ?? null,
+                };
+                if (t.raw) {
+                    Object.assign(base, flattenAndPrefix(t.raw, ""));
+                    if (t.raw.metadata) Object.assign(base, flattenAndPrefix(t.raw.metadata, "metadata_"));
+                }
+                return base;
+            });
+            await BodyTemperature.insertMany(docs);
         }
 
-        // --- BLOOD GLUCOSE ---
-        if (bloodGlucose?.length) {
-            const rows = bloodGlucose.map((g) => ({
-                userId,
-                timestamp: new Date(g.timestamp),
-                level: g.level,
-            }));
-            await BloodGlucose.insertMany(rows);
+        if (Array.isArray(weight) && weight.length) {
+            const docs = weight.map((w) => {
+                const ts = safeDate(w.timestamp || timestamp);
+                const base = {
+                    userId,
+                    healthDataId,
+                    timestamp: ts || new Date(),
+                    kilograms: w.kilograms ?? w.value ?? null,
+                };
+                if (w.raw) {
+                    Object.assign(base, flattenAndPrefix(w.raw, ""));
+                    if (w.raw.metadata) Object.assign(base, flattenAndPrefix(w.raw.metadata, "metadata_"));
+                }
+                return base;
+            });
+            await Weight.insertMany(docs);
         }
 
-        // --- BODY TEMPERATURE ---
-        if (bodyTemperature?.length) {
-            const rows = bodyTemperature.map((t) => ({
-                userId,
-                timestamp: new Date(t.timestamp),
-                celsius: t.celsius,
-            }));
-            await BodyTemperature.insertMany(rows);
+        if (Array.isArray(hydration) && hydration.length) {
+            const docs = hydration.map((h) => {
+                const ts = safeDate(h.timestamp || timestamp);
+                const base = {
+                    userId,
+                    healthDataId,
+                    timestamp: ts || new Date(),
+                    liters: h.liters ?? h.value ?? null,
+                };
+                if (h.raw) {
+                    Object.assign(base, flattenAndPrefix(h.raw, ""));
+                    if (h.raw.metadata) Object.assign(base, flattenAndPrefix(h.raw.metadata, "metadata_"));
+                }
+                return base;
+            });
+            await Hydration.insertMany(docs);
         }
 
-        // --- WEIGHT ---
-        if (weight?.length) {
-            const rows = weight.map((w) => ({
-                userId,
-                timestamp: new Date(w.timestamp),
-                kilograms: w.kilograms,
-            }));
-            await Weight.insertMany(rows);
+        if (Array.isArray(sleep) && sleep.length) {
+            const docs = sleep.map((s) => {
+                const start = safeDate(s.startTime);
+                const end = safeDate(s.endTime);
+                const ts = end || start || new Date();
+                const base = {
+                    userId,
+                    healthDataId,
+                    startTime: start,
+                    endTime: end,
+                    timestamp: ts,
+                    durationMinutes: s.durationMinutes ?? (s.totalMinutes ?? null),
+                };
+                if (s.raw) {
+                    Object.assign(base, flattenAndPrefix(s.raw, ""));
+                    if (s.raw.metadata) Object.assign(base, flattenAndPrefix(s.raw.metadata, "metadata_"));
+                }
+                return base;
+            });
+            await Sleep.insertMany(docs);
         }
 
-        // --- HYDRATION ---
-        if (hydration?.length) {
-            const rows = hydration.map((h) => ({
-                userId,
-                timestamp: new Date(h.timestamp),
-                totalLiters: h.liters,
-            }));
-            await Hydration.insertMany(rows);
+        if (Array.isArray(exercise) && exercise.length) {
+            const docs = exercise.map((e) => {
+                const start = safeDate(e.startTime);
+                const end = safeDate(e.endTime);
+                const ts = end || start || new Date();
+                const base = {
+                    userId,
+                    healthDataId,
+                    timestamp: ts,
+                    type: e.type,
+                    startTime: start,
+                    endTime: end,
+                    durationMinutes: e.durationMinutes ?? null,
+                };
+                if (e.raw) {
+                    Object.assign(base, flattenAndPrefix(e.raw, ""));
+                    if (e.raw.metadata) Object.assign(base, flattenAndPrefix(e.raw.metadata, "metadata_"));
+                }
+                return base;
+            });
+            await Exercise.insertMany(docs);
         }
 
-        // --- SLEEP ---
-        if (sleep?.length) {
-            const rows = sleep.map((s) => ({
-                userId,
-                startTime: new Date(s.startTime),
-                endTime: new Date(s.endTime),
-                timestamp: new Date(s.endTime),
-                totalMinutes: s.durationMinutes,
-                totalHours: parseFloat((s.durationMinutes / 60).toFixed(2)),
-                sessions: 1,
-            }));
-            await Sleep.insertMany(rows);
-        }
-
-        // --- EXERCISE ---
-        if (exercise?.length) {
-            const rows = exercise.map((e) => ({
-                userId,
-                timestamp: new Date(e.endTime || e.startTime),
-                type: e.type,
-                startTime: new Date(e.startTime),
-                endTime: new Date(e.endTime),
-                durationMinutes: e.durationMinutes,
-            }));
-            await Exercise.insertMany(rows);
-        }
-
-        res.status(200).json({
+        return res.status(200).json({
             success: true,
             message: "Health data saved successfully",
             recordId: combinedRow._id,
@@ -281,30 +356,20 @@ app.post("/healthdata", async (req, res) => {
     }
 });
 
-/* ------------------------------------------------------------------
-    GET ALL HEALTH DATA SUMMARY
--------------------------------------------------------------------*/
 app.get("/healthdata/:userId", async (req, res) => {
     try {
         const { userId } = req.params;
-
-        const data = await HealthData.find({ userId })
-            .sort({ timestamp: -1 })
-            .limit(100);
-
+        const data = await HealthData.find({ userId }).sort({ timestamp: -1 }).limit(100);
         res.status(200).json({ success: true, data });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
 
-/* ------------------------------------------------------------------
-    GET RAW METRIC DATA
--------------------------------------------------------------------*/
+
 app.get("/healthdata/:userId/:metric", async (req, res) => {
     try {
         const { userId, metric } = req.params;
-
         const collections = {
             steps: Steps,
             heartrate: HeartRate,
@@ -319,15 +384,10 @@ app.get("/healthdata/:userId/:metric", async (req, res) => {
             sleep: Sleep,
             exercise: Exercise,
         };
-
         const Model = collections[metric.toLowerCase()];
-        if (!Model)
-            return res.status(400).json({ error: "Invalid metric name" });
+        if (!Model) return res.status(400).json({ error: "Invalid metric name" });
 
-        const data = await Model.find({ userId })
-            .sort({ timestamp: -1 })
-            .limit(200);
-
+        const data = await Model.find({ userId }).sort({ timestamp: -1 }).limit(200);
         res.status(200).json({ success: true, data });
     } catch (err) {
         console.error("❌ Error fetching metric:", err);
