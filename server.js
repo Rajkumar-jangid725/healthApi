@@ -44,13 +44,40 @@ mongoose.connect(MONGODB_URI, {
         process.exit(1);
     });
 
+
 app.post("/latest-healthdata", async (req, res) => {
     try {
         const { userId } = req.body;
         if (!userId) return res.status(400).json({ message: "userId is required" });
 
-        const latest = await HealthData.findOne({ userId }).sort({ timestamp: -1 }).select("timestamp");
-        res.status(200).json({ success: true, latestTimestamp: latest ? latest.timestamp : null });
+        const getLatest = async (Model, filter = {}) => {
+            const doc = await Model.findOne({ userId, ...filter })
+                .sort({ timestamp: -1 })
+                .select("timestamp");
+            return doc ? doc.timestamp.toISOString() : null;
+        };
+
+        const latestTimestamps = {
+            steps: await getLatest(Steps),
+            heartRate: await getLatest(HeartRate),
+            calories: await getLatest(Calories, { type: "total" }),
+            activeCalories: await getLatest(Calories, { type: "active" }),
+            sleep: await getLatest(Sleep),
+            oxygenSaturation: await getLatest(OxygenSaturation),
+            distance: await getLatest(Distance),
+            bloodPressure: await getLatest(BloodPressure),
+            bloodGlucose: await getLatest(BloodGlucose),
+            bodyTemperature: await getLatest(BodyTemperature),
+            weight: await getLatest(Weight),
+            hydration: await getLatest(Hydration),
+            exercise: await getLatest(Exercise),
+        };
+
+        return res.status(200).json({
+            success: true,
+            latestTimestamps,
+        });
+
     } catch (err) {
         console.error("❌ Error /latest-healthdata:", err);
         res.status(500).json({ error: err.message });
@@ -365,7 +392,6 @@ app.get("/healthdata/:userId", async (req, res) => {
         res.status(500).json({ error: err.message });
     }
 });
-
 
 app.get("/healthdata/:userId/:metric", async (req, res) => {
     try {
