@@ -1,14 +1,14 @@
-const mongoose = require('mongoose');
+const mongoose = require("mongoose");
 
-const StepsSchema = new mongoose.Schema({
-  userId: { type: String, required: true, index: true },
-  healthDataId: { type: mongoose.Schema.Types.ObjectId, ref: 'HealthData', index: true },
-  timestamp: { type: Date, required: true, index: true },
-  count: { type: Number, required: true },
-  startTime: { type: Date },
-  endTime: { type: Date },
+const stepsSchema = new mongoose.Schema({
+    userId: { type: String, required: true, index: true },
+    healthDataId: { type: mongoose.Schema.Types.ObjectId, ref: "HealthData" },
+    timestamp: { type: Date, default: Date.now, index: true },
+    count: { type: Number, default: 0 },
+    startTime: { type: Date, default: null },
+    endTime: { type: Date, default: null },
 }, { timestamps: true, strict: false });
 
-StepsSchema.index({ userId: 1, timestamp: -1 });
+stepsSchema.index({ userId: 1, timestamp: -1 });
 
-module.exports = mongoose.model('Steps', StepsSchema);
+module.exports = mongoose.model("Steps", stepsSchema);

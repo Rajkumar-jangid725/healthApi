@@ -1,12 +1,12 @@
-const mongoose = require('mongoose');
+const mongoose = require("mongoose");
 
-const HydrationSchema = new mongoose.Schema({
-  userId: { type: String, required: true, index: true },
-  healthDataId: { type: mongoose.Schema.Types.ObjectId, ref: 'HealthData' },
-  timestamp: { type: Date, required: true },
-  liters: { type: Number, default: 0 },
-}, { timestamps: true, strict: false });
+const hydrationSchema = new mongoose.Schema({
+    userId: { type: String, required: true, index: true },
+    healthDataId: { type: mongoose.Schema.Types.ObjectId, ref: "HealthData" },
+    timestamp: { type: Date, default: Date.now, index: true },
+    liters: { type: Number, default: null },
+}, { timestamps: true });
 
-HydrationSchema.index({ userId: 1, timestamp: -1 });
+hydrationSchema.index({ userId: 1, timestamp: -1 });
 
-module.exports = mongoose.model('Hydration', HydrationSchema);
+module.exports = mongoose.model("Hydration", hydrationSchema);

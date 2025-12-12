@@ -1,15 +1,14 @@
-const mongoose = require('mongoose');
+const mongoose = require("mongoose");
 
-const SleepSchema = new mongoose.Schema({
-  userId: { type: String, required: true, index: true },
-  healthDataId: {type: mongoose.Schema.Types.ObjectId, ref: 'HealthData', index: true },
-  timestamp: { type: Date, required: true },
-  startTime: { type: Date, required: true },
-  endTime: { type: Date, required: true },
-  durationMinutes: { type: Number },
-  raw: { type: mongoose.Schema.Types.Mixed },
+const sleepSchema = new mongoose.Schema({
+    userId: { type: String, required: true, index: true },
+    healthDataId: { type: mongoose.Schema.Types.ObjectId, ref: "HealthData" },
+    timestamp: { type: Date, default: Date.now, index: true },
+    startTime: { type: Date, default: null },
+    endTime: { type: Date, default: null },
+    durationMinutes: { type: Number, default: null },
 }, { timestamps: true });
 
-SleepSchema.index({ userId: 1, startTime: -1 });
+sleepSchema.index({ userId: 1, timestamp: -1 });
 
-module.exports = mongoose.model('Sleep', SleepSchema);
+module.exports = mongoose.model("Sleep", sleepSchema);

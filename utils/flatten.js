@@ -1,69 +1,30 @@
-// function flattenDeep(obj, prefix = "") {
-//   const out = {};
-
-//   function recurse(cur, pre) {
-//     if (cur === null || cur === undefined) return;
-//     if (typeof cur !== "object" || cur instanceof Date) {
-//       out[pre.replace(/\.$/, "")] = cur;
-//       return;
-//     }
-//     if (Array.isArray(cur)) {
-//       out[pre.replace(/\.$/, "")] = cur;
-//       return;
-//     }
-//     for (const k of Object.keys(cur)) {
-//       recurse(cur[k], `${pre}${k}_`);
-//     }
-//   }
-
-//   recurse(obj, prefix);
-//   return out;
-// }
-
-// module.exports = { flattenDeep };
-
-
+/**
+ * Flatten nested objects into a single-level object with dot notation keys
+ * @param {Object} obj - Object to flatten
+ * @param {string} prefix - Prefix for keys
+ * @returns {Object} Flattened object
+ */
 function flattenDeep(obj, prefix = "") {
-    const out = {};
-
-    function recurse(cur, pre) {
-        if (cur === null || cur === undefined) return;
-
-        if (typeof cur !== "object" || cur instanceof Date) {
-            out[pre.replace(/_$/, "")] = cur;
-            return;
-        }
-
-        if (Array.isArray(cur)) {
-            out[pre.replace(/_$/, "")] = cur;
-            return;
-        }
-
-        for (const k of Object.keys(cur)) {
-            recurse(cur[k], `${pre}${k}_`);
+    if (!obj || typeof obj !== "object") return {};
+    
+    let result = {};
+    
+    for (const [key, value] of Object.entries(obj)) {
+        const newKey = prefix ? `${prefix}.${key}` : key;
+        
+        if (value === null || value === undefined) {
+            result[newKey] = value;
+        } else if (Array.isArray(value)) {
+            result[newKey] = value;
+        } else if (typeof value === "object" && !(value instanceof Date)) {
+            // Recursively flatten nested objects
+            Object.assign(result, flattenDeep(value, newKey));
+        } else {
+            result[newKey] = value;
         }
     }
-
-    recurse(obj, prefix);
-    return out;
+    
+    return result;
 }
 
-function removeDuplicates(base, flat) {
-    const cleaned = {};
-
-    for (const key of Object.keys(flat)) {
-        const isDuplicate = Object.keys(base).some((baseKey) => {
-            return (
-                key === baseKey ||
-                key.startsWith(baseKey + "_") ||
-                key.startsWith(baseKey + "__")
-            );
-        });
-
-        if (!isDuplicate) cleaned[key] = flat[key];
-    }
-
-    return cleaned;
-}
-
-module.exports = { flattenDeep, removeDuplicates };
+module.exports = { flattenDeep };

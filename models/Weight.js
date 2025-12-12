@@ -1,12 +1,12 @@
-const mongoose = require('mongoose');
+const mongoose = require("mongoose");
 
-const WeightSchema = new mongoose.Schema({
-  userId: { type: String, required: true, index: true },
-  healthDataId: { type: mongoose.Schema.Types.ObjectId, ref: 'HealthData' },
-  timestamp: { type: Date, required: true },
-  kilograms: { type: Number },
-}, { timestamps: true, strict: false });
+const weightSchema = new mongoose.Schema({
+    userId: { type: String, required: true, index: true },
+    healthDataId: { type: mongoose.Schema.Types.ObjectId, ref: "HealthData" },
+    timestamp: { type: Date, default: Date.now, index: true },
+    kilograms: { type: Number, default: null },
+}, { timestamps: true });
 
-WeightSchema.index({ userId: 1, timestamp: -1 });
+weightSchema.index({ userId: 1, timestamp: -1 });
 
-module.exports = mongoose.model('Weight', WeightSchema);
+module.exports = mongoose.model("Weight", weightSchema);
