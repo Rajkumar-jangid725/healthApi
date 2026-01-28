@@ -1,6 +1,3 @@
-// ============================================================================
-// DEPENDENCIES
-// ============================================================================
 const express = require("express");
 const mongoose = require("mongoose");
 const cors = require("cors");
@@ -42,6 +39,12 @@ const MONGODB_URI = process.env.MONGODB_URI || "mongodb://localhost:27017/health
 app.use(cors());
 app.use(bodyParser.json({ limit: "50mb" }));
 app.use(bodyParser.urlencoded({ extended: true, limit: "50mb" }));
+
+// Cache control middleware for summary endpoint (30 seconds)
+const cacheMiddleware = (duration) => (req, res, next) => {
+    res.set('Cache-Control', `public, max-age=${duration}`);
+    next();
+};
 
 // ============================================================================
 // DATABASE CONNECTION
@@ -439,23 +442,47 @@ const saveOxygenSaturationData = async (healthData, userId, healthDataId, timest
 };
 
 /**
- * Save blood pressure data to database
+ * Save blood pressure data to database (type/value per document)
  */
 const saveBloodPressureData = async (healthData, userId, healthDataId, timestamp) => {
     const bloodPressure = healthData.bloodPressure || [];
     if (!Array.isArray(bloodPressure) || !bloodPressure.length) return;
 
-    const docs = bloodPressure.map((bp) => {
+    // Accepts: [{type: 'systolic', value: 120, ...}, {type: 'diastolic', value: 80, ...}] or legacy {systolic, diastolic}
+    const docs = [];
+    bloodPressure.forEach(bp => {
         const ts = safeDate(bp.timestamp || bp.time || timestamp);
-        return {
-            userId,
-            healthDataId,
-            timestamp: ts || new Date(),
-            systolic: bp.systolic?.inMillimetersOfMercury || bp.systolic?.value || bp.systolic || null,
-            diastolic: bp.diastolic?.inMillimetersOfMercury || bp.diastolic?.value || bp.diastolic || null,
-        };
+        if (bp.type && bp.value !== undefined) {
+            docs.push({
+                userId,
+                healthDataId,
+                timestamp: ts || new Date(),
+                type: bp.type,
+                value: bp.value
+            });
+        } else {
+            // Legacy: {systolic, diastolic}
+            if (bp.systolic !== undefined) {
+                docs.push({
+                    userId,
+                    healthDataId,
+                    timestamp: ts || new Date(),
+                    type: 'systolic',
+                    value: bp.systolic
+                });
+            }
+            if (bp.diastolic !== undefined) {
+                docs.push({
+                    userId,
+                    healthDataId,
+                    timestamp: ts || new Date(),
+                    type: 'diastolic',
+                    value: bp.diastolic
+                });
+            }
+        }
     });
-    await BloodPressure.insertMany(docs);
+    if (docs.length) await BloodPressure.insertMany(docs);
 };
 
 /**
@@ -700,7 +727,7 @@ app.post("/healthdata/batch", async (req, res) => {
             const healthData = batchData[i];
 
             try {
-                console.log(`   📝 [${i + 1}/${batchData.length}] Processing user: ${healthData.userId}`);
+                console.log(`   🔍 [${i + 1}/${batchData.length}] Processing user: ${healthData.userId}`);
                 
                 const result = await processSingleHealthData(healthData);
                 
@@ -785,13 +812,109 @@ app.get("/healthdata/:userId", async (req, res) => {
 });
 
 /**
+ * GET /healthdata/:userId/summary
+ * Returns the latest value for each health metric for dashboard summary
+ * IMPORTANT: This route must be defined BEFORE /healthdata/:userId/:metric
+ * Optimized with 30-second cache
+ */
+app.get("/healthdata/:userId/summary", cacheMiddleware(30), async (req, res) => {
+    try {
+        const { userId } = req.params;
+        console.log('--- /healthdata/:userId/summary DEBUG ---');
+        console.log('Received userId:', userId);
+        if (!userId) {
+            console.log('No userId provided in params!');
+            return res.status(400).json({ error: "userId is required" });
+        }
+
+        // Map of metric name to Mongoose model and value field(s)
+        // Use keys that match frontend HEALTH_DATA_TYPES ids exactly
+        const metrics = {
+            bloodpressure: { model: BloodPressure },
+            heartrate: { model: HeartRate, value: "bpm" },
+            steps: { model: Steps, value: "count" },
+            calories: { model: Calories, value: "kilocalories" },
+            distance: { model: Distance, value: "meters" },
+            sleep: { model: Sleep, value: "durationMinutes" },
+            weight: { model: Weight, value: "kilograms" },
+            oxygen: { model: OxygenSaturation, value: "percentage", altFields: ["percent", "value", "oxygenSaturation"] },
+            glucose: { model: BloodGlucose, value: "mmolPerL" },
+            temperature: { model: BodyTemperature, value: "celsius" },
+            hydration: { model: Hydration, value: "liters" }
+        };
+
+        const summary = {};
+        for (const [key, { model, value, altFields }] of Object.entries(metrics)) {
+            try {
+                if (!model) {
+                    console.error(`Model for metric '${key}' is not defined.`);
+                    summary[key] = { value: null, timestamp: null };
+                    continue;
+                }
+                if (key === 'bloodpressure') {
+                    // Get latest systolic and diastolic
+                    const systolicDoc = await model.findOne({ userId, type: 'systolic' }).sort({ timestamp: -1 });
+                    const diastolicDoc = await model.findOne({ userId, type: 'diastolic' }).sort({ timestamp: -1 });
+                    summary[key] = {
+                        value: [systolicDoc ? systolicDoc.value : null, diastolicDoc ? diastolicDoc.value : null],
+                        timestamp: systolicDoc && diastolicDoc ? (systolicDoc.timestamp > diastolicDoc.timestamp ? systolicDoc.timestamp.toISOString() : diastolicDoc.timestamp.toISOString()) : (systolicDoc ? systolicDoc.timestamp.toISOString() : (diastolicDoc ? diastolicDoc.timestamp.toISOString() : null))
+                    };
+                    continue;
+                }
+                const doc = await model.findOne({ userId }).sort({ timestamp: -1 });
+                if (key === 'oxygen' && doc) {
+                    console.log(`🔍 OXYGEN DEBUG - Full doc:`, JSON.stringify(doc, null, 2));
+                    console.log(`🔍 OXYGEN DEBUG - doc.percentage:`, doc.percentage, `type:`, typeof doc.percentage);
+                    console.log(`🔍 OXYGEN DEBUG - All doc keys:`, Object.keys(doc.toObject ? doc.toObject() : doc));
+                }
+                console.log(`Metric: ${key}, Query: { userId: ${userId} }, Found:`, doc ? 'YES' : 'NO', doc ? `value: ${doc[Array.isArray(value) ? value[0] : value]}` : '');
+                if (!doc) {
+                    summary[key] = { value: null, timestamp: null };
+                } else if (Array.isArray(value)) {
+                    summary[key] = {
+                        value: value.map(v => doc[v] ?? null),
+                        timestamp: doc.timestamp ? doc.timestamp.toISOString() : null
+                    };
+                } else {
+                    let extractedValue = doc[value] ?? null;
+                    // Try alternative field names if primary field is null
+                    if (extractedValue === null && altFields && Array.isArray(altFields)) {
+                        for (const altField of altFields) {
+                            if (doc[altField] !== null && doc[altField] !== undefined) {
+                                extractedValue = doc[altField];
+                                console.log(`✅ Using alternative field '${altField}' for ${key}: ${extractedValue}`);
+                                break;
+                            }
+                        }
+                    }
+                    summary[key] = {
+                        value: extractedValue,
+                        timestamp: doc.timestamp ? doc.timestamp.toISOString() : null
+                    };
+                }
+            } catch (err) {
+                console.error(`Error fetching summary for metric '${key}':`, err.message);
+                summary[key] = { value: null, timestamp: null };
+            }
+        }
+
+        console.log('Summary result:', JSON.stringify(summary, null, 2));
+        return res.json({ success: true, summary });
+    } catch (err) {
+        console.error('Error in /healthdata/:userId/summary:', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+/**
  * GET /healthdata/:userId/:metric
  * Retrieve specific metric data for a user
  */
 app.get("/healthdata/:userId/:metric", async (req, res) => {
     try {
         const { userId, metric } = req.params;
-        
+        const { period } = req.query;
+
         const collections = {
             steps: Steps,
             heartrate: HeartRate,
@@ -806,21 +929,356 @@ app.get("/healthdata/:userId/:metric", async (req, res) => {
             sleep: Sleep,
             exercise: Exercise,
         };
-        
+
         const Model = collections[metric.toLowerCase()];
         if (!Model) {
             return res.status(400).json({ error: "Invalid metric name" });
         }
 
-        const data = await Model.find({ userId })
-            .sort({ timestamp: -1 })
-            .limit(200);
-        
+        // Calculate date range based on period
+        const currentDate = new Date();
+        let startDate = new Date();
+
+        switch(period) {
+            case 'daily':
+                startDate.setDate(currentDate.getDate() - 1);
+                break;
+            case 'weekly':
+                startDate.setDate(currentDate.getDate() - 7);
+                break;
+            case 'monthly':
+                startDate.setDate(currentDate.getDate() - 30);
+                break;
+            case 'quarterly':
+                startDate.setDate(currentDate.getDate() - 90);
+                break;
+            case 'yearly':
+                startDate.setDate(currentDate.getDate() - 365);
+                break;
+            default:
+                startDate.setDate(currentDate.getDate() - 7); // Default to weekly
+        }
+
+        let data = await Model.find({ 
+            userId,
+            timestamp: {
+                $gte: startDate,
+                $lte: currentDate
+            }
+        })
+            .sort({ timestamp: 1 }) // Sort ASC (oldest to newest)
+            .limit(2000)
+            .lean();
+
+        // Group data by day
+        const groupByDay = (arr) => {
+            return arr.reduce((acc, item) => {
+                const day = item.timestamp.toISOString().slice(0, 10);
+                if (!acc[day]) acc[day] = [];
+                acc[day].push(item);
+                return acc;
+            }, {});
+        };
+
+        // Only filter for weekly/monthly, not daily
+        if (metric.toLowerCase() === 'bloodpressure' && (period === 'weekly' || period === 'monthly')) {
+            // For each day, keep first and last value for both diastolic & systolic
+            const grouped = groupByDay(data);
+            let filtered = [];
+            Object.values(grouped).forEach(dayArr => {
+                if (dayArr.length === 1) {
+                    filtered.push(dayArr[0]);
+                } else if (dayArr.length > 1) {
+                    // Separate systolic and diastolic by type field
+                    const systolicArr = dayArr.filter(d => d.type === 'systolic');
+                    const diastolicArr = dayArr.filter(d => d.type === 'diastolic');
+                    
+                    // Get first and last for systolic
+                    if (systolicArr.length > 0) {
+                        filtered.push(systolicArr[0]); // first
+                        if (systolicArr.length > 1) {
+                            filtered.push(systolicArr[systolicArr.length - 1]); // last
+                        }
+                    }
+                    
+                    // Get first and last for diastolic
+                    if (diastolicArr.length > 0) {
+                        filtered.push(diastolicArr[0]); // first
+                        if (diastolicArr.length > 1) {
+                            filtered.push(diastolicArr[diastolicArr.length - 1]); // last
+                        }
+                    }
+                }
+            });
+            data = filtered.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+            console.log(`Filtered bloodpressure data for period '${period}':`, JSON.stringify(data, null, 2));
+        } else if (period === 'weekly') {
+            // For each day, get first and last reading (generic)
+            const grouped = groupByDay(data);
+            let filtered = [];
+            Object.values(grouped).forEach(dayArr => {
+                if (dayArr.length === 1) {
+                    filtered.push(dayArr[0]);
+                } else if (dayArr.length > 1) {
+                    filtered.push(dayArr[0]); // first
+                    filtered.push(dayArr[dayArr.length - 1]); // last
+                }
+            });
+            data = filtered.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+        } else if (period === 'monthly') {
+            // For each day, get only the first value (generic)
+            const grouped = groupByDay(data);
+            let filtered = [];
+            Object.values(grouped).forEach(dayArr => {
+                filtered.push(dayArr[0]);
+            });
+            data = filtered.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+        }
+
+        // Special formatting for bloodpressure to match /blood_pressure endpoint (now with type/value)
+        if (metric.toLowerCase() === 'bloodpressure') {
+            if (!data.length) {
+                return res.status(200).json({
+                    success: true,
+                    sortedBloodData: [],
+                    totalRecords: 0,
+                    dateValue: new Date().toISOString().slice(0, 10),
+                    message: "No data available for the selected period"
+                });
+            }
+            // Group by timestamp and userId, then map type/value to systolic/diastolic
+            const grouped = {};
+            data.forEach(item => {
+                const key = item.userId + '|' + (item.timestamp ? item.timestamp.toISOString() : '');
+                if (!grouped[key]) grouped[key] = { dateFrom: item.timestamp?.toISOString(), userId: item.userId, systolic: null, diastolic: null, unit: "mmHg" };
+                if (item.type === 'systolic') grouped[key].systolic = item.value;
+                if (item.type === 'diastolic') grouped[key].diastolic = item.value;
+            });
+            const formattedBloodData = Object.values(grouped).sort((a, b) => new Date(a.dateFrom) - new Date(b.dateFrom));
+            const latestDateFormatted = formattedBloodData.length > 0 
+                ? formattedBloodData[formattedBloodData.length - 1].dateFrom.slice(0, 10)
+                : new Date().toISOString().slice(0, 10);
+            return res.status(200).json({
+                success: true,
+                sortedBloodData: formattedBloodData,
+                dateValue: latestDateFormatted,
+                totalRecords: formattedBloodData.length,
+                period: period || 'weekly',
+                dateRange: {
+                    start: formattedBloodData[0]?.dateFrom,
+                    end: formattedBloodData[formattedBloodData.length - 1]?.dateFrom
+                }
+            });
+        }
+
+        // Default: return generic data
         res.status(200).json({ success: true, data });
     } catch (err) {
         console.error("❌ Error fetching metric:", err);
         res.status(500).json({ error: err.message });
     }
+});
+
+app.post("/healthdata/:userId/:metric/range", async (req, res) => {
+    try {
+        const { userId, metric } = req.params;
+        const { startTime, endTime } = req.body;
+
+        if (!startTime || !endTime) {
+            return res.status(400).json({ 
+                error: 'startTime and endTime are required' 
+            });
+        }
+
+        const queryStart = new Date(startTime);
+        const queryEnd = new Date(endTime);
+        
+        if (isNaN(queryStart) || isNaN(queryEnd)) {
+            return res.status(400).json({ error: 'Invalid startTime or endTime' });
+        }
+
+        const modelMap = {
+            steps: Steps,
+            heartrate: HeartRate,
+            heart_rate: HeartRate,
+            sleep: Sleep,
+            calories: Calories,
+            oxygen: OxygenSaturation,
+            distance: Distance,
+            bloodpressure: BloodPressure,
+            blood_pressure: BloodPressure,
+            glucose: BloodGlucose,
+            bloodglucose: BloodGlucose,
+            temperature: BodyTemperature,
+            bodytemperature: BodyTemperature,
+            weight: Weight,
+            hydration: Hydration,
+            exercise: Exercise,
+        };
+
+        const Model = modelMap[metric.toLowerCase()];
+        if (!Model) {
+            return res.status(400).json({ error: 'Invalid metric' });
+        }
+
+        console.log(`📊 Fetching ${metric} data for user: ${userId}`);
+        console.log(`📅 Date range: ${queryStart.toISOString()} to ${queryEnd.toISOString()}`);
+
+        let data = await Model.find({
+            userId: userId,
+            timestamp: {
+                $gte: queryStart,
+                $lte: queryEnd
+            }
+        })
+        .sort({ timestamp: 1 })
+        .limit(5000)
+        .lean();
+
+        console.log(`📦 Initial query found ${data.length} ${metric} records`);
+        if (metric.toLowerCase() === 'bloodpressure' && data.length > 0) {
+            console.log('🩺 Sample blood pressure records:', JSON.stringify(data.slice(0, 3), null, 2));
+        }
+
+        // Determine range type (daily/weekly/monthly) based on range length
+        const msInDay = 24 * 60 * 60 * 1000;
+        const rangeDays = Math.round((queryEnd - queryStart) / msInDay);
+        let rangeType = 'custom';
+        if (rangeDays <= 1) rangeType = 'daily';
+        else if (rangeDays <= 8) rangeType = 'weekly';
+        else if (rangeDays <= 32) rangeType = 'monthly';
+
+        // Group data by day
+        const groupByDay = (arr) => {
+            return arr.reduce((acc, item) => {
+                const day = item.timestamp.toISOString().slice(0, 10);
+                if (!acc[day]) acc[day] = [];
+                acc[day].push(item);
+                return acc;
+            }, {});
+        };
+
+        // Only filter for weekly/monthly, not daily
+        if (metric.toLowerCase() === 'bloodpressure' && (rangeType === 'weekly' || rangeType === 'monthly')) {
+            // For each day, keep first and last value for both diastolic & systolic
+            const grouped = groupByDay(data);
+            let filtered = [];
+            Object.values(grouped).forEach(dayArr => {
+                if (dayArr.length === 1) {
+                    filtered.push(dayArr[0]);
+                } else if (dayArr.length > 1) {
+                    // Separate systolic and diastolic by type field
+                    const systolicArr = dayArr.filter(d => d.type === 'systolic');
+                    const diastolicArr = dayArr.filter(d => d.type === 'diastolic');
+                    
+                    // Get first and last for systolic
+                    if (systolicArr.length > 0) {
+                        filtered.push(systolicArr[0]); // first
+                        if (systolicArr.length > 1) {
+                            filtered.push(systolicArr[systolicArr.length - 1]); // last
+                        }
+                    }
+                    
+                    // Get first and last for diastolic
+                    if (diastolicArr.length > 0) {
+                        filtered.push(diastolicArr[0]); // first
+                        if (diastolicArr.length > 1) {
+                            filtered.push(diastolicArr[diastolicArr.length - 1]); // last
+                        }
+                    }
+                }
+            });
+            data = filtered.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+            console.log(`🩺 After filtering for ${rangeType}: ${data.length} blood pressure records`);
+        } else if (rangeType === 'weekly') {
+            // For each day, get first and last reading (generic)
+            const grouped = groupByDay(data);
+            let filtered = [];
+            Object.values(grouped).forEach(dayArr => {
+                if (dayArr.length === 1) {
+                    filtered.push(dayArr[0]);
+                } else if (dayArr.length > 1) {
+                    filtered.push(dayArr[0]); // first
+                    filtered.push(dayArr[dayArr.length - 1]); // last
+                }
+            });
+            data = filtered.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+        } else if (rangeType === 'monthly') {
+            // For each day, get only the first value (generic)
+            const grouped = groupByDay(data);
+            let filtered = [];
+            Object.values(grouped).forEach(dayArr => {
+                filtered.push(dayArr[0]);
+            });
+            data = filtered.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+        }
+
+        if (!data.length) {
+            console.log(`ℹ️ No ${metric} data found for user: ${userId} in specified range`);
+            // Return appropriate format based on metric type
+            let emptyResponse = { success: true, data: [], totalRecords: 0 };
+            
+            if (metric.toLowerCase() === 'heartrate' || metric.toLowerCase() === 'heart_rate') {
+                emptyResponse.sortedHeartData = [];
+            } else if (metric.toLowerCase() === 'bloodpressure' || metric.toLowerCase() === 'blood_pressure') {
+                emptyResponse.sortedBloodData = [];
+            }
+            
+            return res.status(200).json(emptyResponse);
+        }
+
+        console.log(`✅ ${metric} data retrieved: ${data.length} records`);
+
+        // Format response based on metric type for backward compatibility
+        let responseData = {
+            success: true,
+            data: data,
+            totalRecords: data.length,
+            dateRange: {
+                start: data[0]?.timestamp,
+                end: data[data.length - 1]?.timestamp
+            }
+        };
+
+        // Add metric-specific formatted data for compatibility
+        if (metric.toLowerCase() === 'heartrate' || metric.toLowerCase() === 'heart_rate') {
+            responseData.sortedHeartData = data.map(item => ({
+                timestamp: item.timestamp.toISOString(),
+                userId: item.userId,
+                bpm: item.bpm.toString(),
+                unit: "bpm",
+                type: "HEART_RATE"
+            }));
+        } else if (metric.toLowerCase() === 'bloodpressure' || metric.toLowerCase() === 'blood_pressure') {
+            // Group by timestamp and userId, then map type/value to systolic/diastolic
+            const grouped = {};
+            data.forEach(item => {
+                const key = item.userId + '|' + (item.timestamp ? item.timestamp.toISOString() : '');
+                if (!grouped[key]) grouped[key] = { dateFrom: item.timestamp?.toISOString(), userId: item.userId, systolic: null, diastolic: null, unit: "mmHg" };
+                if (item.type === 'systolic') grouped[key].systolic = item.value;
+                if (item.type === 'diastolic') grouped[key].diastolic = item.value;
+            });
+            responseData.sortedBloodData = Object.values(grouped).sort((a, b) => new Date(a.dateFrom) - new Date(b.dateFrom));
+        }
+
+        res.status(200).json(responseData);
+    } catch (error) {
+        console.error(`❌ Error fetching ${req.params.metric} data:`, error);
+        res.status(500).json({ 
+            success: false, 
+            error: 'Internal server error',
+            message: error.message
+        });
+    }
+});
+
+/**
+ * POST /healthdata/:userId/steps/range
+ * Get steps data for a time range (alias for metric=steps)
+ */
+app.post("/healthdata/:userId/steps/range", async (req, res) => {
+    req.params.metric = 'steps';
+    return app._router.handle(req, res, () => {});
 });
 
 /**
@@ -892,199 +1350,18 @@ app.delete("/healthdata/:userId", async (req, res) => {
 });
 
 /**
- * POST /blood_pressure
- * Get blood pressure data for a specific user (for testing purposes)
+ * REMOVED: /blood_pressure endpoint - use /healthdata/:userId/bloodpressure?period=weekly instead
+ * Or use /healthdata/:userId/bloodpressure/range for specific date ranges
  */
-app.post("/blood_pressure", async (req, res) => {
-    try {
-        const { userId, period } = req.body;
 
-        if (!userId) {
-            return res.status(400).json({ 
-                success: false, 
-                error: "userId is required" 
-            });
-        }
+/**
+ * REMOVED: /blood_pressure/range endpoint - use /healthdata/:userId/bloodpressure/range instead
+ */
 
-        console.log(`🩺 Fetching blood pressure data for user: ${userId}, period: ${period || 'default'}`);
-
-        // Calculate date range based on period
-        const currentDate = new Date();
-        let startDate = new Date();
-        
-        switch(period) {
-            case 'weekly':
-                startDate.setDate(currentDate.getDate() - 7);
-                break;
-            case 'monthly':
-                startDate.setDate(currentDate.getDate() - 30);
-                break;
-            case 'quarterly':
-                startDate.setDate(currentDate.getDate() - 90);
-                break;
-            case 'yearly':
-                startDate.setDate(currentDate.getDate() - 365);
-                break;
-            default:
-                startDate.setDate(currentDate.getDate() - 7); // Default to weekly
-        }
-
-        console.log(`📅 Date range: ${startDate.toISOString()} to ${currentDate.toISOString()}`);
-
-        // Fetch blood pressure data from MongoDB
-        const bloodPressureData = await BloodPressure.find({
-            userId: userId,
-            timestamp: {
-                $gte: startDate,
-                $lte: currentDate
-            }
-        })
-        .sort({ timestamp: 1 }) // Sort by oldest first (ASC) for proper chart ordering
-        .lean();
-
-        if (bloodPressureData.length === 0) {
-            console.log(`ℹ️ No blood pressure data found for user: ${userId}`);
-            return res.status(204).end();
-        }
-
-        // Format data for response with correct field names
-        const formattedBloodData = bloodPressureData.map(item => ({
-            dateFrom: item.timestamp.toISOString(),
-            userId: item.userId,
-            systolic: item.systolic,
-            diastolic: item.diastolic,
-            unit: "mmHg"
-        }));
-
-        const latestDateFormatted = formattedBloodData.length > 0 
-            ? formattedBloodData[formattedBloodData.length - 1].dateFrom.slice(0, 10)
-            : new Date().toISOString().slice(0, 10);
-
-        console.log(`✅ Blood pressure data retrieved: ${formattedBloodData.length} records for ${period || 'weekly'}`);
-
-        res.status(200).json({
-            success: true,
-            sortedBloodData: formattedBloodData,
-            dateValue: latestDateFormatted,
-            totalRecords: formattedBloodData.length,
-            period: period || 'weekly',
-            dateRange: {
-                start: formattedBloodData[0]?.dateFrom,
-                end: formattedBloodData[formattedBloodData.length - 1]?.dateFrom
-            }
-        });
-    } catch (error) {
-        console.error("❌ Error fetching blood pressure data:", error);
-        res.status(500).json({ 
-            success: false, 
-            error: "Internal Server Error",
-            message: error.message
-        });
-    }
-});
-
-app.post("/heart_rate", async (req, res) => {
-    try {
-        const { userId, startDate, endDate, period } = req.body;
-
-        if (!userId) {
-            return res.status(400).json({ 
-                success: false, 
-                error: "User ID is required" 
-            });
-        }
-
-        console.log(`❤️ Fetching heart rate data for user: ${userId}`);
-        
-        // Calculate date range based on parameters or defaults
-        const currentDate = new Date();
-        let queryStartDate, queryEndDate;
-        
-        if (startDate && endDate) {
-            // Use provided date range
-            queryStartDate = new Date(startDate);
-            queryEndDate = new Date(endDate);
-            console.log(`📅 Using custom date range: ${queryStartDate.toISOString()} to ${queryEndDate.toISOString()}`);
-        } else if (period) {
-            // Calculate based on period
-            queryEndDate = currentDate;
-            queryStartDate = new Date();
-            
-            switch(period) {
-                case 'weekly':
-                    queryStartDate.setDate(currentDate.getDate() - 7);
-                    break;
-                case 'monthly':
-                    queryStartDate.setDate(currentDate.getDate() - 30);
-                    break;
-                case 'quarterly':
-                    queryStartDate.setDate(currentDate.getDate() - 90);
-                    break;
-                case 'yearly':
-                    queryStartDate.setDate(currentDate.getDate() - 365);
-                    break;
-                default:
-                    queryStartDate.setDate(currentDate.getDate() - 1095); // 3 years default
-            }
-            console.log(`📅 Using period ${period}: ${queryStartDate.toISOString()} to ${queryEndDate.toISOString()}`);
-        } else {
-            // Default to last 3 years
-            queryEndDate = currentDate;
-            queryStartDate = new Date();
-            queryStartDate.setDate(currentDate.getDate() - 1095);
-            console.log(`📅 Using default 3 years: ${queryStartDate.toISOString()} to ${queryEndDate.toISOString()}`);
-        }
-
-        // Fetch heart rate data from MongoDB
-        const heartRateData = await HeartRate.find({
-            userId: userId,
-            timestamp: {
-                $gte: queryStartDate,
-                $lte: queryEndDate
-            }
-        })
-        .sort({ timestamp: 1 }) // Sort by oldest first (ASC) for proper chart ordering
-        .lean();
-
-        if (heartRateData.length === 0) {
-            console.log(`ℹ️ No heart rate data found for user: ${userId} in specified range`);
-            return res.status(204).end();
-        }
-
-        // Format data for response with correct field names
-        const sortedHeartData = heartRateData.map(item => ({
-            timestamp: item.timestamp.toISOString(), // Changed from dateFrom to timestamp
-            userId: item.userId,
-            bpm: item.bpm.toString(), // Changed from value to bpm, ensure string
-            unit: "bpm",
-            type: "HEART_RATE"
-        }));
-
-        const latestRecord = sortedHeartData[sortedHeartData.length - 1];
-        const latestDateFormatted = latestRecord.timestamp.slice(0, 10);
-
-        console.log(`✅ Heart rate data retrieved: ${sortedHeartData.length} records`);
-        console.log(`📊 Date range: ${sortedHeartData[0].timestamp} to ${latestRecord.timestamp}`);
-
-        res.status(200).json({
-            success: true,
-            sortedHeartData: sortedHeartData, // Array sorted oldest to newest
-            dateValue: latestDateFormatted,
-            totalRecords: sortedHeartData.length,
-            dateRange: {
-                start: sortedHeartData[0].timestamp,
-                end: latestRecord.timestamp
-            }
-        });
-    } catch (error) {
-        console.error("❌ Error fetching heart rate data:", error);
-        res.status(500).json({ 
-            success: false, 
-            error: "Internal Server Error",
-            message: error.message
-        });
-    }
-});
+/**
+ * REMOVED: /heart_rate endpoint - use /healthdata/:userId/heartrate?period=weekly instead
+ * Or use /healthdata/:userId/heartrate/range for specific date ranges
+ */
 
 
 /**

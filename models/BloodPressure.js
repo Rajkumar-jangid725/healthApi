@@ -4,8 +4,8 @@ const bloodPressureSchema = new mongoose.Schema({
     userId: { type: String, required: true, index: true },
     healthDataId: { type: mongoose.Schema.Types.ObjectId, ref: "HealthData" },
     timestamp: { type: Date, default: Date.now, index: true },
-    systolic: { type: Number, default: null },
-    diastolic: { type: Number, default: null },
+    type: { type: String, required: true },
+    value: { type: Number, required: true },
 }, { timestamps: true });
 
 bloodPressureSchema.index({ userId: 1, timestamp: -1 });
